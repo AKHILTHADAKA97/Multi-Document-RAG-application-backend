@@ -6,6 +6,16 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 load_dotenv()
 
+def _default_data_dir() -> Path:
+    env_dir = os.getenv('DATA_DIR')
+    if env_dir:
+        return Path(env_dir)
+    # Automatically use Render persistent disk when mounted at /var/data
+    render_disk = Path('/var/data')
+    if render_disk.is_dir():
+        return render_disk
+    return Path('./data')
+
 def _parse_origins(app_env: str = 'development', frontend_url: str = '') -> list[str]:
     origins = set()
 
@@ -45,7 +55,7 @@ def _parse_origins(app_env: str = 'development', frontend_url: str = '') -> list
 class Config:
     app_env: str = field(default_factory=lambda: os.getenv('APP_ENV', 'development').lower())
     frontend_url: str = field(default_factory=lambda: os.getenv('FRONTEND_URL', 'https://muldocrag.vercel.app'))
-    data_dir: Path = field(default_factory=lambda: Path(os.getenv('DATA_DIR', './data')))
+    data_dir: Path = field(default_factory=_default_data_dir)
     embedding_backend: str = field(default_factory=lambda: os.getenv('EMBEDDING_BACKEND', 'semantic'))
     embedding_model: str = field(default_factory=lambda: os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2'))
     rerank_model: str = field(default_factory=lambda: os.getenv('RERANK_MODEL', 'cross-encoder/ms-marco-MiniLM-L-6-v2'))
@@ -80,6 +90,9 @@ class Config:
         if self.max_pdf_pages < 1 or self.max_context_chars < 1000:
             raise ValueError('Page and context limits must be positive')
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'uploads').mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'extracted').mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'index').mkdir(parents=True, exist_ok=True)
         if self.answer_mode not in {'auto', 'extractive', 'llm'}:
             raise ValueError('ANSWER_MODE must be auto, extractive or llm')
         if self.max_chunks < 1 or self.max_upload_mb < 1:
@@ -87,6 +100,9 @@ class Config:
         if self.max_pdf_pages < 1 or self.max_context_chars < 1000:
             raise ValueError('Page and context limits must be positive')
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'uploads').mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'extracted').mkdir(parents=True, exist_ok=True)
+        (self.data_dir / 'index').mkdir(parents=True, exist_ok=True)
 
     @property
     def effective_answer_mode(self):

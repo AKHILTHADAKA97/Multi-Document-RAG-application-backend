@@ -81,6 +81,9 @@ class RAGService:
                 (uploads_dir / f"{document_id}_{name}").write_bytes(data)
                 sections = extract(name, data, ocr=self.config.enable_ocr,
                                    max_pdf_pages=self.config.max_pdf_pages)
+                extracted_dir = self.config.data_dir / 'extracted'
+                extracted_dir.mkdir(parents=True, exist_ok=True)
+                (extracted_dir / f"{document_id}.txt").write_text('\n\n'.join(t for _, t in sections), encoding='utf-8')
                 chunks = chunk_sections(sections, doc_title=name)
                 count = self.db.rows('SELECT COUNT(*) AS n FROM chunks')[0]['n']
                 if count + len(chunks) > self.config.max_chunks:
@@ -110,12 +113,19 @@ class RAGService:
                 if not db.execute('SELECT 1 FROM chunks LIMIT 1').fetchone():
                     db.execute('DELETE FROM kv WHERE key="index_signature"')
                 uploads_dir = self.config.data_dir / 'uploads'
+                extracted_dir = self.config.data_dir / 'extracted'
                 if rows:
                     name = rows[0][0]
                     f_path = uploads_dir / f"{document_id}_{name}"
                     if f_path.is_file():
                         try:
                             f_path.unlink()
+                        except Exception:
+                            pass
+                    ext_path = extracted_dir / f"{document_id}.txt"
+                    if ext_path.is_file():
+                        try:
+                            ext_path.unlink()
                         except Exception:
                             pass
             # Historical answers intentionally preserve excerpts; UI explains this.
@@ -208,9 +218,12 @@ class RAGService:
             summary = bool(SUMMARY_INTENT.search(request.question))
             retrieval_question = request.question if summary else self._resolve_follow_up(request.question, history)
             with self.lock:
+                retrieval_t0 = time.perf_counter()
                 sources, diagnostics = self.retriever.search(
                     retrieval_question, request.document_ids, settings,
                     page=page, top_k_override=10 if summary else None, force=summary)
+                retrieval_ms = round((time.perf_counter() - retrieval_t0) * 1000)
+                gen_ms = 0
                 if not sources:
                     result = {'answer': REFUSAL, 'citations': [], 'status': 'not_found',
                               'answer_type': 'not_found', 'confidence': 'low', 'usage': None}
@@ -221,10 +234,12 @@ class RAGService:
                     enriched = self._sources(sources)
                     context = '' if summary or retrieval_question == request.question else \
                         ' '.join((turn.get('question') or '') for turn in history[-2:])
+                    gen_t0 = time.perf_counter()
                     result = generate(self.config, request.question, enriched,
                                       history=history, context=context,
                                       system_prompt=self.settings().system_prompt,
                                       model_override=self.settings().model)
+                    gen_ms = round((time.perf_counter() - gen_t0) * 1000)
                     cited_citations = set(result.get('citations') or [])
                     if not cited_citations:
                         cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
@@ -243,6 +258,11 @@ class RAGService:
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
                 'retrieval': diagnostics,
+                'timings': {
+                    'retrieval_ms': retrieval_ms,
+                    'generation_ms': gen_ms,
+                    'total_ms': round((time.perf_counter() - started) * 1000),
+                },
                 'checks': {
                     'citation_ids_valid': citation_ids_valid,
                     'grounded_in_sources': result.get('status') == 'answered' and len(used_sources) > 0,
