@@ -12,7 +12,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS documents (
               id TEXT PRIMARY KEY, name TEXT NOT NULL, digest TEXT UNIQUE NOT NULL,
               size INTEGER NOT NULL, status TEXT NOT NULL, error TEXT,
-              chunk_count INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+              chunk_count INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              storage_path TEXT, file_type TEXT);
             CREATE TABLE IF NOT EXISTS chunks (
               id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
               location TEXT NOT NULL, text TEXT NOT NULL, vector TEXT NOT NULL,
@@ -41,6 +42,12 @@ class Database:
             db.execute('ALTER TABLE chunks ADD COLUMN chunk_index INTEGER')
         if 'section' not in columns:
             db.execute('ALTER TABLE chunks ADD COLUMN section TEXT')
+
+        doc_cols = {row[1] for row in db.execute('PRAGMA table_info(documents)')}
+        if 'storage_path' not in doc_cols:
+            db.execute('ALTER TABLE documents ADD COLUMN storage_path TEXT')
+        if 'file_type' not in doc_cols:
+            db.execute('ALTER TABLE documents ADD COLUMN file_type TEXT')
 
     @contextmanager
     def connect(self):

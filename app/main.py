@@ -81,6 +81,19 @@ def create_app(config=None):
             'answer_mode': config.effective_answer_mode,
         }
 
+    @app.get('/health/live', include_in_schema=True)
+    def health_live():
+        return {
+            'status': 'alive',
+            'timestamp': time.time(),
+            'service': 'Atlas Multi-Document RAG',
+            'environment': config.app_env,
+        }
+
+    @app.get('/health/ready', include_in_schema=True)
+    def health_ready():
+        return ready()
+
     @app.get('/ready', include_in_schema=True)
     def ready():
         try:
@@ -129,9 +142,26 @@ def create_app(config=None):
     def api_health():
         return health()
 
+    @api.get('/health/live', include_in_schema=False)
+    def api_health_live():
+        return health_live()
+
+    @api.get('/health/ready', include_in_schema=False)
+    def api_health_ready():
+        return health_ready()
+
     @api.get('/ready', include_in_schema=False)
     def api_ready():
         return ready()
+
+    @api.get('/system/diagnostics')
+    def system_diagnostics():
+        return service.diagnostics()
+
+    @api.post('/system/test-connections')
+    def system_test_connections(request: Request):
+        limited(request, 'system_test', 12)
+        return service.test_connections()
 
     @api.get('/config')
     def public_config():
@@ -198,6 +228,10 @@ def create_app(config=None):
             raise AppError('DOCUMENT_NOT_FOUND', 'Document no longer exists.', 404)
         service.db.execute('UPDATE documents SET name=? WHERE id=?', (body.name, document_id))
         return {'updated': True, 'id': document_id, 'name': body.name}
+
+    @api.post('/documents/{document_id}/retry')
+    def retry_document_processing(document_id: str):
+        return service.retry_document(document_id)
 
     @api.get('/documents/{document_id}/chunks')
     def chunks(document_id: str, page: int = Query(1, ge=1)):
