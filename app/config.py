@@ -6,6 +6,22 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 load_dotenv()
 
+def _parse_origins() -> list[str]:
+    defaults = {
+        'https://muldocrag.vercel.app',
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+    }
+    raw = os.getenv('CORS_ORIGINS', '')
+    if raw:
+        for item in raw.split(','):
+            cleaned = item.strip().rstrip('/')
+            if cleaned:
+                defaults.add(cleaned)
+    return list(defaults)
+
 @dataclass
 class Config:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv('DATA_DIR', './data')))
@@ -19,7 +35,7 @@ class Config:
     model: str = field(default_factory=lambda: os.getenv('LLM_MODEL') or os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b'))
     api_key: str = field(default_factory=lambda: os.getenv('LLM_API_KEY') or os.getenv('GROQ_API_KEY', ''))
     app_token: str = field(default_factory=lambda: os.getenv('APP_TOKEN', ''))
-    cors_origins: list[str] = field(default_factory=lambda: os.getenv('CORS_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(','))
+    cors_origins: list[str] = field(default_factory=_parse_origins)
     max_upload_mb: int = field(default_factory=lambda: int(os.getenv('MAX_UPLOAD_MB', '20')))
     max_chunks: int = field(default_factory=lambda: int(os.getenv('MAX_CHUNKS', '10000')))
     max_pdf_pages: int = field(default_factory=lambda: int(os.getenv('MAX_PDF_PAGES', '500')))

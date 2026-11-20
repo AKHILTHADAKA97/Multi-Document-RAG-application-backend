@@ -46,9 +46,15 @@ def create_app(config=None):
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.cors_origins,
-        allow_methods=['GET', 'POST', 'PUT', 'DELETE'],
-        allow_headers=['Content-Type', 'X-App-Token'],
+        allow_origin_regex=r'https://.*\.vercel\.app',
+        allow_credentials=True,
+        allow_methods=['*'],
+        allow_headers=['*'],
     )
+
+    @app.get('/favicon.ico', include_in_schema=False)
+    def favicon():
+        return Response(status_code=204)
 
     @app.exception_handler(AppError)
     async def app_error(request, exc):
