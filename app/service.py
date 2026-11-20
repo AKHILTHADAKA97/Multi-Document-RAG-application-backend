@@ -14,7 +14,9 @@ from .generation import REFUSAL, generate, generate_stream
 from .parsing import extract, chunk_sections, SUPPORTED
 from .retrieval import Embedder, Retriever, page_number_from_question, classify_question
 from .schemas import Settings
-from .query_understanding_agent import QueryUnderstandingAgent
+from .query_understanding import QueryUnderstandingAgent
+from .document_retriever import FiveStageDocumentRetriever
+from .grounded_answer_generator import GroundedAnswerGenerator, REFUSAL_MESSAGE
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ class RAGService:
         self.db = Database(config.data_dir / 'rag.sqlite3')
         self.embedder = Embedder(config)
         self.retriever = Retriever(config, self.db, self.embedder)
+        self.five_stage_retriever = FiveStageDocumentRetriever(self.retriever)
         # Single process reference implementation: serialize model access and mutation.
         self.lock = threading.RLock()
         self.db.execute('UPDATE documents SET status="failed", error="Processing interrupted. Delete this file and upload again." WHERE status="processing"')
@@ -339,51 +342,41 @@ class RAGService:
             page = page_number_from_question(request.question)
             summary = bool(SUMMARY_INTENT.search(request.question))
 
-            # Intelligent Query Understanding & Normalization
-            understood = QueryUnderstandingAgent.process_query(request.question, history)
-            q_info = classify_question(understood['retrieval_query'])
+            # Intelligent Query Understanding (Spelling + Grammar + Context Resolution)
+            understood = QueryUnderstandingAgent.analyze_query(request.question, history)
+            q_info = classify_question(understood['grammar_normalized_query'])
 
-            retrieval_question = request.question if summary else understood['retrieval_query']
             with self.lock:
                 retrieval_t0 = time.perf_counter()
-                sources, diagnostics = self.retriever.search(
-                    retrieval_question, request.document_ids, settings,
-                    page=page, top_k_override=10 if summary else None, force=summary)
+                sources, diagnostics = self.five_stage_retriever.search_5_stages(
+                    understood, request.document_ids, settings, page=page
+                )
                 retrieval_ms = round((time.perf_counter() - retrieval_t0) * 1000)
-                gen_ms = 0
-                if not sources:
-                    result = {'answer': REFUSAL, 'citations': [], 'status': 'not_found',
-                              'answer_type': 'not_found', 'confidence': 'low', 'usage': None}
-                    enriched = []
-                    used_sources = []
-                    citation_ids_valid = True
-                else:
-                    enriched = self._sources(sources)
-                    context = '' if summary or retrieval_question == request.question else \
-                        ' '.join((turn.get('question') or '') for turn in history[-2:])
-                    gen_t0 = time.perf_counter()
-                    result = generate(self.config, request.question, enriched,
-                                      history=history, context=context,
-                                      system_prompt=self.settings().system_prompt,
-                                      model_override=self.settings().model)
-                    gen_ms = round((time.perf_counter() - gen_t0) * 1000)
-                    cited_citations = set(result.get('citations') or [])
-                    if not cited_citations:
-                        cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
-                    all_citations = {s.get('citation') for s in enriched}
-                    citation_ids_valid = bool(cited_citations and cited_citations.issubset(all_citations))
-                    # Include only sources actually used in the answer
-                    used_sources = [s for s in enriched if s.get('citation') in cited_citations]
-                    if not used_sources and result.get('status') == 'answered':
-                        used_sources = enriched[:1]
 
-            # Generate smart follow-up question suggestions
-            suggested_questions = QueryUnderstandingAgent.generate_suggestions(
-                understood.get('corrected_query') or request.question,
-                result.get('answer', ''),
-                sources=enriched,
-                history=history,
-            )
+                enriched = self._sources(sources) if sources else []
+                context = '' if summary else ' '.join((turn.get('question') or '') for turn in history[-2:])
+
+                gen_t0 = time.perf_counter()
+                result = GroundedAnswerGenerator.generate_answer(
+                    self.config,
+                    understood['grammar_normalized_query'],
+                    enriched,
+                    diagnostics=diagnostics,
+                    history=history,
+                    context=context,
+                    system_prompt=self.settings().system_prompt,
+                    model_override=self.settings().model,
+                )
+                gen_ms = round((time.perf_counter() - gen_t0) * 1000)
+
+                cited_citations = set(result.get('citations') or [])
+                if not cited_citations:
+                    cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
+                all_citations = {s.get('citation') for s in enriched}
+                citation_ids_valid = bool(cited_citations and cited_citations.issubset(all_citations))
+                used_sources = [s for s in enriched if s.get('citation') in cited_citations]
+                if not used_sources and result.get('status') == 'answered' and enriched:
+                    used_sources = enriched[:1]
 
             response = {
                 **base,
@@ -392,15 +385,15 @@ class RAGService:
                 'conversationId': conversation_id,
                 'messageId': message_id,
                 'originalQuestion': request.question,
-                'correctedQuery': understood.get('corrected_query'),
+                'correctedQuery': understood.get('grammar_normalized_query') or understood.get('spelling_corrected_query'),
+                'normalizedQuery': understood.get('grammar_normalized_query'),
                 'isCorrected': understood.get('is_corrected', False),
-                'correctionNotes': understood.get('correction_notes', []),
+                'correctionNotes': [c.get('corrected') for c in understood.get('corrections', []) if 'corrected' in c],
                 'understoodIntent': understood.get('intent', 'general'),
                 'isFollowUp': understood.get('is_follow_up', False),
                 'referencedEntity': understood.get('referenced_entity'),
-                'isDuplicate': understood.get('is_duplicate', False),
-                'suggestedQuestions': suggested_questions,
-                'suggested_questions': suggested_questions,
+                'suggestedQuestions': [],
+                'suggested_questions': [],
                 'questionInfo': q_info,
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
@@ -444,102 +437,83 @@ class RAGService:
             page = page_number_from_question(request.question)
             summary = bool(SUMMARY_INTENT.search(request.question))
 
-            # Stage 1: Understanding Question (Intelligent Query Agent)
-            understood = QueryUnderstandingAgent.process_query(request.question, history)
-            q_info = classify_question(understood['retrieval_query'])
+            # Stage 1: Understanding Question
+            yield f"event: stage\ndata: {json.dumps({'stage': 'understanding_question', 'label': 'Understanding Question', 'detail': 'Understanding your question...'})}\n\n"
 
-            intent_label = understood['intent'].capitalize()
+            understood = QueryUnderstandingAgent.analyze_query(request.question, history)
+            q_info = classify_question(understood['grammar_normalized_query'])
+
+            # Stage 2: Correcting spelling and grammar
+            norm_q = understood.get("grammar_normalized_query", "")
             if understood.get('is_corrected'):
-                detail_msg = f"Intent: {intent_label} · Corrected typo: \"{understood['corrected_query']}\""
-            elif understood.get('is_follow_up') and understood.get('referenced_entity'):
-                detail_msg = f"Intent: {intent_label} · Context resolved: \"{understood['referenced_entity']}\""
+                stage_data = {
+                    'stage': 'normalizing_query',
+                    'label': 'Correcting Spelling & Grammar',
+                    'detail': f'Normalized question: "{norm_q}"',
+                    'corrected_query': norm_q,
+                    'is_corrected': True
+                }
             else:
-                terms_preview = ', '.join(q_info['entities'][:3]) if q_info['entities'] else 'query concepts'
-                detail_msg = f"Intent: {intent_label} · Key search terms: {terms_preview}"
+                stage_data = {
+                    'stage': 'normalizing_query',
+                    'label': 'Query Validated',
+                    'detail': 'Correcting spelling and grammar...',
+                    'corrected_query': norm_q,
+                    'is_corrected': False
+                }
+            yield f"event: stage\ndata: {json.dumps(stage_data)}\n\n"
 
-            yield f"event: stage\ndata: {json.dumps({'stage': 'understanding_question', 'label': 'Understanding Question', 'detail': detail_msg, 'corrected_query': understood.get('corrected_query'), 'is_corrected': understood.get('is_corrected', False)})}\n\n"
-
-            retrieval_question = request.question if summary else understood['retrieval_query']
-
-            # Stage 2: Generating Embeddings
-            yield f"event: stage\ndata: {json.dumps({'stage': 'generating_embeddings', 'label': 'Generating Embeddings', 'detail': 'Converting question into vector embeddings for semantic similarity...'})}\n\n"
-
-            # Stage 3 & 4: Retrieving Documents & Reranking
+            # Stage 3: Searching uploaded documents (Five-Stage Retrieval Agent)
             with self.lock:
-                yield f"event: stage\ndata: {json.dumps({'stage': 'retrieving_documents', 'label': 'Retrieving Relevant Documents', 'detail': 'Executing parallel hybrid search (vector cosine + BM25 keyword matching)...'})}\n\n"
-
-                def on_retrieval_stage(stage, label, detail):
-                    pass
+                yield f"event: stage\ndata: {json.dumps({'stage': 'searching_documents', 'label': 'Searching Uploaded Documents', 'detail': 'Searching uploaded documents across semantic vector & keyword indexes...'})}\n\n"
 
                 retrieval_t0 = time.perf_counter()
-                sources, diagnostics = self.retriever.search(
-                    retrieval_question, request.document_ids, settings,
-                    page=page, top_k_override=10 if summary else None, force=summary
+                sources, diagnostics = self.five_stage_retriever.search_5_stages(
+                    understood, request.document_ids, settings, page=page
                 )
                 retrieval_ms = round((time.perf_counter() - retrieval_t0) * 1000)
 
-                if settings.rerank:
-                    yield f"event: stage\ndata: {json.dumps({'stage': 'reranking_results', 'label': 'Reranking Results', 'detail': f'Evaluating and prioritizing {len(sources)} candidate excerpts with cross-match reranker...'})}\n\n"
+                # Stage 4: Checking relevant information
+                yield f"event: stage\ndata: {json.dumps({'stage': 'evaluating_relevance', 'label': 'Checking Relevant Information', 'detail': f'Found {len(sources)} candidate excerpts. Verifying relevance threshold...'})}\n\n"
 
-                # Stage 5: Building Context
-                yield f"event: stage\ndata: {json.dumps({'stage': 'building_context', 'label': 'Building Context', 'detail': f'Deduplicating and assembling context from {len(sources)} grounded excerpts...'})}\n\n"
+                enriched = self._sources(sources) if sources else []
+                context = '' if summary else ' '.join((turn.get('question') or '') for turn in history[-2:])
 
-                if not sources:
-                    result = {'answer': REFUSAL, 'citations': [], 'status': 'not_found',
-                              'answer_type': 'not_found', 'confidence': 'low', 'usage': None}
-                    enriched = []
-                    used_sources = []
-                    citation_ids_valid = True
-                    ttft_ms = 0
-                    gen_ms = 0
-                else:
-                    enriched = self._sources(sources)
-                    context = '' if summary or retrieval_question == request.question else \
-                        ' '.join((turn.get('question') or '') for turn in history[-2:])
+                # Stage 5: Verifying document matches
+                yield f"event: stage\ndata: {json.dumps({'stage': 'verifying_matches', 'label': 'Verifying Document Matches', 'detail': 'Auditing factual grounding and provenance references...'})}\n\n"
 
-                    # Stage 6: Generating Answer (streaming tokens)
-                    active_model = self.settings().model or self.config.model
-                    yield f"event: stage\ndata: {json.dumps({'stage': 'generating_answer', 'label': 'Generating Answer', 'detail': f'Synthesizing grounded response using {active_model}...' })}\n\n"
+                # Stage 6: Generating your answer
+                yield f"event: stage\ndata: {json.dumps({'stage': 'generating_answer', 'label': 'Generating Your Answer', 'detail': 'Generating your answer based on uploaded document content...'})}\n\n"
 
-                    gen_t0 = time.perf_counter()
-                    gen_result = None
-                    for token_event in generate_stream(
-                        self.config, request.question, enriched,
-                        history=history, context=context,
-                        system_prompt=self.settings().system_prompt,
-                        model_override=self.settings().model
-                    ):
-                        if token_event.get('type') == 'token':
-                            yield f"event: token\ndata: {json.dumps({'token': token_event['token']})}\n\n"
-                        elif token_event.get('type') == 'done':
-                            gen_result = token_event
+                gen_t0 = time.perf_counter()
+                gen_result = None
+                for token_event in GroundedAnswerGenerator.generate_answer_stream(
+                    self.config,
+                    understood['grammar_normalized_query'],
+                    enriched,
+                    diagnostics=diagnostics,
+                    history=history,
+                    context=context,
+                    system_prompt=self.settings().system_prompt,
+                    model_override=self.settings().model,
+                ):
+                    if token_event.get('type') == 'token':
+                        yield f"event: token\ndata: {json.dumps({'token': token_event['token']})}\n\n"
+                    elif token_event.get('type') == 'done':
+                        gen_result = token_event
 
-                    gen_ms = round((time.perf_counter() - gen_t0) * 1000)
-                    result = gen_result or {'answer': REFUSAL, 'citations': [], 'status': 'not_found'}
-                    ttft_ms = result.get('ttft_ms', gen_ms)
+                gen_ms = round((time.perf_counter() - gen_t0) * 1000)
+                result = gen_result or {'answer': REFUSAL_MESSAGE, 'citations': [], 'status': 'not_found'}
+                ttft_ms = result.get('ttft_ms', gen_ms)
 
-                    # Stage 7: Validating Response
-                    yield f"event: stage\ndata: {json.dumps({'stage': 'validating_response', 'label': 'Validating Response', 'detail': 'Verifying inline citations and grounding against source excerpts...'})}\n\n"
-
-                    cited_citations = set(result.get('citations') or [])
-                    if not cited_citations:
-                        cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
-                    all_citations = {s.get('citation') for s in enriched}
-                    citation_ids_valid = bool(cited_citations and cited_citations.issubset(all_citations))
-                    used_sources = [s for s in enriched if s.get('citation') in cited_citations]
-                    if not used_sources and result.get('status') == 'answered':
-                        used_sources = enriched[:1]
-
-            # Stage 8: Finalizing Response
-            yield f"event: stage\ndata: {json.dumps({'stage': 'finalizing_response', 'label': 'Finalizing Response', 'detail': 'Formatting final answer and generating smart follow-ups...'})}\n\n"
-
-            # Generate smart follow-up suggestions
-            suggested_questions = QueryUnderstandingAgent.generate_suggestions(
-                understood.get('corrected_query') or request.question,
-                result.get('answer', ''),
-                sources=enriched,
-                history=history,
-            )
+                cited_citations = set(result.get('citations') or [])
+                if not cited_citations:
+                    cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
+                all_citations = {s.get('citation') for s in enriched}
+                citation_ids_valid = bool(cited_citations and cited_citations.issubset(all_citations))
+                used_sources = [s for s in enriched if s.get('citation') in cited_citations]
+                if not used_sources and result.get('status') == 'answered' and enriched:
+                    used_sources = enriched[:1]
 
             total_ms = round((time.perf_counter() - started) * 1000)
             response = {
@@ -549,15 +523,15 @@ class RAGService:
                 'conversationId': conversation_id,
                 'messageId': message_id,
                 'originalQuestion': request.question,
-                'correctedQuery': understood.get('corrected_query'),
+                'correctedQuery': understood.get('grammar_normalized_query') or understood.get('spelling_corrected_query'),
+                'normalizedQuery': understood.get('grammar_normalized_query'),
                 'isCorrected': understood.get('is_corrected', False),
-                'correctionNotes': understood.get('correction_notes', []),
+                'correctionNotes': [c.get('corrected') for c in understood.get('corrections', []) if 'corrected' in c],
                 'understoodIntent': understood.get('intent', 'general'),
                 'isFollowUp': understood.get('is_follow_up', False),
                 'referencedEntity': understood.get('referenced_entity'),
-                'isDuplicate': understood.get('is_duplicate', False),
-                'suggestedQuestions': suggested_questions,
-                'suggested_questions': suggested_questions,
+                'suggestedQuestions': [],
+                'suggested_questions': [],
                 'questionInfo': q_info,
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
