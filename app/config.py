@@ -9,12 +9,28 @@ load_dotenv()
 def _default_data_dir() -> Path:
     env_dir = os.getenv('DATA_DIR')
     if env_dir:
-        return Path(env_dir)
+        p = Path(env_dir)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+
     # Automatically use Render persistent disk when mounted at /var/data
     render_disk = Path('/var/data')
     if render_disk.is_dir():
-        return render_disk
-    return Path('./data')
+        try:
+            # Check write permission on mounted disk
+            test_file = render_disk / '.write_test'
+            test_file.touch()
+            test_file.unlink()
+            return render_disk
+        except Exception as exc:
+            logging.getLogger(__name__).warning(f"/var/data is not writable ({exc}), falling back to ./data")
+
+    local_data = Path('./data')
+    local_data.mkdir(parents=True, exist_ok=True)
+    return local_data
 
 def _parse_origins(app_env: str = 'development', frontend_url: str = '') -> list[str]:
     origins = set()

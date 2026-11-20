@@ -4,7 +4,7 @@ COPY requirements*.txt ./
 RUN pip install --no-cache-dir -r requirements-semantic.txt
 COPY app ./app
 COPY main.py ./
-RUN useradd --create-home rag && mkdir -p /app/data /var/data && chown -R rag:rag /app /var/data
+RUN useradd --create-home rag && mkdir -p /app/data /var/data && chmod 777 /app/data /var/data && chown -R rag:rag /app /var/data
 USER rag
 ENV PORT=8000
 EXPOSE 8000
