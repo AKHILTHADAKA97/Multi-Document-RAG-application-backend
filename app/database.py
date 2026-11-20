@@ -24,6 +24,18 @@ class Database:
               id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, question TEXT NOT NULL,
               response TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS conversations (
+              id TEXT PRIMARY KEY, title TEXT NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS attachments (
+              id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+              document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+              file_name TEXT NOT NULL, file_type TEXT NOT NULL,
+              file_size INTEGER NOT NULL, storage_path TEXT,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS idx_attachments_conv ON attachments(conversation_id);
             CREATE TABLE IF NOT EXISTS feedback (
               message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
               rating TEXT NOT NULL, comment TEXT NOT NULL);
@@ -48,6 +60,21 @@ class Database:
             db.execute('ALTER TABLE documents ADD COLUMN storage_path TEXT')
         if 'file_type' not in doc_cols:
             db.execute('ALTER TABLE documents ADD COLUMN file_type TEXT')
+
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS conversations (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+        CREATE TABLE IF NOT EXISTS attachments (
+          id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+          document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+          file_name TEXT NOT NULL, file_type TEXT NOT NULL,
+          file_size INTEGER NOT NULL, storage_path TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+        CREATE INDEX IF NOT EXISTS idx_attachments_conv ON attachments(conversation_id);
+        """)
 
     @contextmanager
     def connect(self):

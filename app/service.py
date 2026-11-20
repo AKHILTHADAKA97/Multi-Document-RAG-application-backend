@@ -190,6 +190,92 @@ class RAGService:
             turns.append({'question': row['question'], 'answer': response.get('answer', '')})
         return turns
 
+    def get_or_create_conversation(self, conversation_id=None, title="New Conversation"):
+        if conversation_id:
+            rows = self.db.rows('SELECT * FROM conversations WHERE id=?', (conversation_id,))
+            if rows:
+                return dict(rows[0])
+        new_id = conversation_id or uid()
+        self.db.execute(
+            'INSERT OR IGNORE INTO conversations(id, title, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)',
+            (new_id, title)
+        )
+        return {'id': new_id, 'title': title}
+
+    def list_conversations(self):
+        rows = self.db.rows('''
+            SELECT c.*, COUNT(m.id) AS message_count
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC
+        ''')
+        return [dict(r) for r in rows]
+
+    def get_conversation_details(self, conversation_id):
+        conv_rows = self.db.rows('SELECT * FROM conversations WHERE id=?', (conversation_id,))
+        if not conv_rows:
+            msg_rows = self.db.rows('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at, rowid', (conversation_id,))
+            if not msg_rows:
+                # Return empty fresh conversation
+                return {'id': conversation_id, 'title': 'New Conversation', 'items': [], 'attachments': []}
+            first_q = msg_rows[0]['question']
+            title = first_q[:45] + ('...' if len(first_q) > 45 else '')
+            self.db.execute('INSERT OR IGNORE INTO conversations(id, title) VALUES (?, ?)', (conversation_id, title))
+            conv = {'id': conversation_id, 'title': title}
+        else:
+            conv = dict(conv_rows[0])
+
+        msg_rows = self.db.rows('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at, rowid', (conversation_id,))
+        items = []
+        for r in msg_rows:
+            try:
+                resp = json.loads(r['response'])
+            except Exception:
+                resp = {'status': 'answered', 'answer': r['response']}
+            items.append({
+                'id': r['id'],
+                'conversation_id': r['conversation_id'],
+                'question': r['question'],
+                'response': resp,
+                'created_at': r.get('created_at'),
+            })
+
+        att_rows = self.db.rows('SELECT * FROM attachments WHERE conversation_id=? ORDER BY created_at', (conversation_id,))
+        attachments = [dict(a) for a in att_rows]
+
+        return {
+            'id': conv['id'],
+            'title': conv.get('title', 'Conversation'),
+            'created_at': conv.get('created_at'),
+            'updated_at': conv.get('updated_at'),
+            'items': items,
+            'attachments': attachments,
+        }
+
+    def add_attachment(self, conversation_id, file):
+        self.get_or_create_conversation(conversation_id)
+        doc = self.upload(file)
+        att_id = uid()
+        fname = doc.get('name', 'file')
+        ftype = fname.split('.')[-1].lower() if '.' in fname else 'unknown'
+        self.db.execute(
+            'INSERT INTO attachments(id, conversation_id, document_id, file_name, file_type, file_size, storage_path) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (att_id, conversation_id, doc.get('id'), fname, ftype, doc.get('size', 0), doc.get('storage_path', ''))
+        )
+        self.db.execute('UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?', (conversation_id,))
+        return {
+            'id': att_id,
+            'conversation_id': conversation_id,
+            'document_id': doc.get('id'),
+            'file_name': fname,
+            'file_type': ftype,
+            'file_size': doc.get('size', 0),
+            'status': doc.get('status', 'ready'),
+            'storage_path': doc.get('storage_path', ''),
+            'doc': doc,
+        }
+
     def messages_for_conversation(self, conversation_id):
         rows = self.db.rows(
             'SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at,rowid',
@@ -200,14 +286,14 @@ class RAGService:
             items.append({'id': row['id'], 'conversation_id': row['conversation_id'],
                           'question': row['question'], 'response': response})
         if not items:
-            raise AppError('CONVERSATION_NOT_FOUND', 'No conversation exists with that ID.', 404)
+            return []
         return items
 
     def delete_conversation(self, conversation_id):
+        self.db.execute('DELETE FROM attachments WHERE conversation_id=?', (conversation_id,))
         deleted = self.db.execute('DELETE FROM messages WHERE conversation_id=?', (conversation_id,))
-        if not deleted:
-            raise AppError('CONVERSATION_NOT_FOUND', 'No conversation exists with that ID.', 404)
-        return deleted
+        self.db.execute('DELETE FROM conversations WHERE id=?', (conversation_id,))
+        return deleted or True
 
     def _resolve_follow_up(self, question, history):
         if not history:
@@ -464,8 +550,12 @@ class RAGService:
             yield f"event: error\ndata: {json.dumps(err_payload)}\n\n"
 
     def save_message(self, question, response):
+        conv_id = response.get('conversation_id') or response.get('conversationId')
+        title = question[:45] + ('...' if len(question) > 45 else '')
+        self.db.execute('INSERT OR IGNORE INTO conversations(id, title) VALUES (?, ?)', (conv_id, title))
+        self.db.execute('UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?', (conv_id,))
         self.db.execute('INSERT INTO messages(id,conversation_id,question,response) VALUES (?,?,?,?)',
-                        (response['id'], response['conversation_id'], question, json.dumps(response)))
+                        (response['id'], conv_id, question, json.dumps(response)))
 
     def diagnostics(self):
         """Comprehensive telemetry and health status across all subsystems."""

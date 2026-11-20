@@ -14,7 +14,8 @@ import zipfile
 from pathlib import Path
 from .errors import AppError
 
-SUPPORTED = {'.pdf', '.docx', '.txt', '.md', '.csv', '.json'}
+IMAGE_SUPPORTED = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
+SUPPORTED = {'.pdf', '.docx', '.txt', '.md', '.csv', '.json'} | IMAGE_SUPPORTED
 MIN_MEANINGFUL_CHARS = 3
 
 
@@ -135,6 +136,28 @@ def extract(name: str, data: bytes, ocr: bool = False, max_pdf_pages: int = 500)
             for i, table in enumerate(doc.tables):
                 rows = '\n'.join(' | '.join(c.text for c in row.cells) for row in table.rows)
                 sections.append((f'Table {i + 1}', clean_text(rows)))
+        elif suffix in IMAGE_SUPPORTED:
+            w, h = 0, 0
+            if suffix == '.png' and len(data) >= 24 and data[:8] == b'\x89PNG\r\n\x1a\n':
+                w = int.from_bytes(data[16:20], 'big')
+                h = int.from_bytes(data[20:24], 'big')
+            elif suffix in {'.jpg', '.jpeg'} and len(data) >= 2:
+                idx = 2
+                while idx < len(data) - 9:
+                    if data[idx] == 0xFF and data[idx+1] in (0xC0, 0xC1, 0xC2):
+                        h = int.from_bytes(data[idx+5:idx+7], 'big')
+                        w = int.from_bytes(data[idx+7:idx+9], 'big')
+                        break
+                    elif data[idx] == 0xFF:
+                        length = int.from_bytes(data[idx+2:idx+4], 'big')
+                        idx += 2 + length
+                    else:
+                        idx += 1
+            size_kb = round(len(data) / 1024, 1)
+            dim_str = f"{w}x{h}" if w and h else "Standard resolution"
+            clean_name = Path(name).stem.replace('_', ' ').replace('-', ' ')
+            content = f"Image Attachment: {name}. Topic: {clean_name}. Format: {suffix.upper()[1:]}. Dimensions: {dim_str}. File size: {size_kb} KB. Attached to conversation for analysis and discussion."
+            sections = [('Image Overview', content)]
         else:
             text = data.decode('utf-8-sig')
             if suffix == '.json':

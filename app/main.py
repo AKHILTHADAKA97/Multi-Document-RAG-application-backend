@@ -297,9 +297,39 @@ def create_app(config=None):
         limited(request, 'chat', config.rate_limit_per_minute)
         return service.answer(body)
 
+    @api.post('/conversations')
+    def create_conversation(body: dict = None):
+        conv_id = body.get('id') or body.get('conversation_id') if body else None
+        title = body.get('title', 'New Conversation') if body else 'New Conversation'
+        return service.get_or_create_conversation(conv_id, title)
+
+    @api.get('/conversations')
+    def list_conversations():
+        return {'conversations': service.list_conversations()}
+
+    @api.get('/conversations/{conversation_id}')
+    def get_conversation(conversation_id: str):
+        return service.get_conversation_details(conversation_id)
+
+    @api.post('/conversations/{conversation_id}/messages')
+    def post_conversation_message(request: Request, conversation_id: str, body: AskRequest):
+        limited(request, 'chat', config.rate_limit_per_minute)
+        body.conversation_id = conversation_id
+        return service.answer(body)
+
+    @api.post('/conversations/{conversation_id}/attachments', status_code=201)
+    def post_conversation_attachment(request: Request, conversation_id: str, file: UploadFile = File(...)):
+        limited(request, 'upload', config.upload_rate_limit_per_minute)
+        return service.add_attachment(conversation_id, file)
+
+    @api.delete('/conversations/{conversation_id}')
+    def delete_conversation_route(conversation_id: str):
+        service.delete_conversation(conversation_id)
+        return {'deleted': True}
+
     @api.get('/chat/history/{conversation_id}')
     def conversation_history(conversation_id: str):
-        return {'conversation_id': conversation_id, 'items': service.messages_for_conversation(conversation_id)}
+        return service.get_conversation_details(conversation_id)
 
     @api.delete('/chat/{conversation_id}')
     def delete_conversation(conversation_id: str):
