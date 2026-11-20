@@ -14,6 +14,49 @@ DEFINITION_PASSAGE = re.compile(r'\b(?:is a|are a|is an|are an|is the|are the|re
 ISOLATED_EXAMPLE = re.compile(r'^\s*(?:for example|for instance|an example|e\.g\.)\b', re.IGNORECASE)
 
 
+def classify_question(question: str) -> dict:
+    """Intelligent lightweight question understanding and intent routing."""
+    q_lower = (question or '').strip().lower()
+    q_clean = PAGE_QUERY.sub(' ', q_lower).strip()
+    q_tokens = [t for t in re.findall(r'\w+', q_clean) if t not in STOP]
+
+    intent = "general"
+    complexity = "simple"
+
+    if DEFINITION_QUERY.search(q_lower):
+        intent = "definition"
+        complexity = "simple"
+    elif re.search(r'\b(summar|overview|key points|recap|tl;?dr|brief)\b', q_lower):
+        intent = "summary"
+        complexity = "complex"
+    elif re.search(r'\b(compare|contrast|difference between|versus|vs\.?)\b', q_lower):
+        intent = "comparison"
+        complexity = "analytical"
+    elif re.search(r'\b(how (?:does|do|can|to)|step|architecture|implementation|code|algorithm|pipeline|equation)\b', q_lower):
+        intent = "technical"
+        complexity = "technical"
+    elif re.search(r'\b(why|explain|reason|evaluate|analyze|pros and cons|impact)\b', q_lower):
+        intent = "analytical"
+        complexity = "analytical"
+    elif len(q_tokens) <= 3 and any(greet in q_lower for greet in ('hi', 'hello', 'hey', 'good morning', 'thanks')):
+        intent = "conversational"
+        complexity = "simple"
+
+    bigrams = [' '.join(pair) for pair in zip(q_tokens[:-1], q_tokens[1:])] if len(q_tokens) >= 2 else []
+    entities = q_tokens[:6]
+
+    return {
+        'intent': intent,
+        'complexity': complexity,
+        'tokens': q_tokens,
+        'entities': entities,
+        'bigrams': bigrams,
+        'is_definition': intent == 'definition',
+        'is_summary': intent == 'summary',
+        'page_filter': page_number_from_question(question),
+    }
+
+
 def expand_query(question: str) -> str:
     """Used for retrieval only. Pass the original question to the LLM."""
     q_clean = (question or '').strip()
@@ -61,10 +104,21 @@ class Embedder:
     def __init__(self, config):
         self.config = config
         self.model = None
+        self._query_cache = {}
 
     @property
     def signature(self):
         return f'{self.config.embedding_backend}:{self.config.embedding_model if self.config.embedding_backend == "semantic" else "hashed-2048-v1"}:chunk140-overlap25'
+
+    def encode_query(self, text: str):
+        clean = (text or '').strip()
+        if clean in self._query_cache:
+            return self._query_cache[clean], True
+        vec = self.encode([clean])[0]
+        if len(self._query_cache) > 300:
+            self._query_cache.pop(next(iter(self._query_cache)))
+        self._query_cache[clean] = vec
+        return vec, False
 
     def encode(self, texts):
         if self.config.embedding_backend == 'lexical':
@@ -111,7 +165,8 @@ class Retriever:
         sql += ' ORDER BY c.document_id, c.rowid'
         return self.db.rows(sql, args)
 
-    def search(self, question, document_ids, settings, page=None, top_k_override=None, force=False):
+    def search(self, question, document_ids, settings, page=None, top_k_override=None, force=False, on_stage=None):
+        import time
         chunks = self._chunks(document_ids)
         if not chunks:
             raise AppError('NO_DOCUMENTS', 'No processed files are available in this selection. Upload a file or select ready documents first.')
@@ -125,12 +180,25 @@ class Retriever:
             chunks = page_filtered
             if not chunks:
                 return [], {'hybrid': True, 'reranking': 'not run: no chunks on the requested page',
-                            'candidate_count': 0, 'page_filter': page, 'threshold': settings.min_similarity}
+                            'candidate_count': 0, 'page_filter': page, 'threshold': settings.min_similarity,
+                            'timings': {'embedding_ms': 0, 'retrieval_ms': 0, 'rerank_ms': 0}}
 
         scoring_question = PAGE_QUERY.sub(' ', question or '').strip() or question
         retrieval_query = expand_query(scoring_question)
+
+        if on_stage:
+            on_stage('generating_embeddings', 'Generating Embeddings', 'Encoding search terms into vector representations...')
+
+        t_embed = time.perf_counter()
+        q_vec, cache_hit = self.embedder.encode_query(retrieval_query)
+        embedding_ms = round((time.perf_counter() - t_embed) * 1000)
+
+        if on_stage:
+            on_stage('retrieving_documents', 'Retrieving Relevant Documents', f'Searching {len(chunks)} chunks across active knowledge sources...')
+
+        t_retrieval = time.perf_counter()
         vectors = np.asarray([json.loads(c.pop('vector')) for c in chunks], dtype=np.float32)
-        dense = vectors @ self.embedder.encode([retrieval_query])[0]
+        dense = vectors @ q_vec
         query_tokens = tokens(retrieval_query)
         corpus = [tokens(c['text']) for c in chunks]
         counts = [Counter(t) for t in corpus]
@@ -149,8 +217,8 @@ class Retriever:
             for rank, i in enumerate(np.argsort(-scores)[:candidate_k], 1):
                 if scores[i] > 0:
                     fused[int(i)] += 1 / (60 + rank)
-        # Prioritize definition and explanatory passages over isolated examples for definition queries
-        # and boost exact section heading matches
+
+        # Heading and definition pattern boosting
         q_norm = re.sub(r'[^a-z0-9\s]', '', scoring_question.lower()).strip()
         q_words = set(q_norm.split()) - STOP
         for i in list(fused.keys()):
@@ -166,13 +234,12 @@ class Retriever:
                     fused[i] += 0.02
                 elif ISOLATED_EXAMPLE.search(text):
                     fused[i] -= 0.01
+
         ranked = [i for i, _ in fused.most_common(candidate_k)]
         if not ranked:
             ranked = list(np.argsort(-dense)[:candidate_k])
 
         if force:
-            # Summary requests have no lexical/semantic query signal. Spread the
-            # candidates across documents and pages instead of taking one bucket.
             grouped = defaultdict(list)
             for index, chunk in enumerate(chunks):
                 grouped[chunk['document_id']].append(index)
@@ -189,23 +256,29 @@ class Retriever:
             ranked = spread
             accepted = spread
         elif page_filtered is not None:
-            # The user explicitly scoped the question to a page; do not let the
-            # generic similarity cutoff hide that page's content.
             accepted = ranked
         else:
             accepted = [i for i in ranked
                         if dense[i] >= settings.min_similarity
                         and (self.config.embedding_backend != 'lexical' or sparse[i] > 0)]
+
+        retrieval_ms = round((time.perf_counter() - t_retrieval) * 1000)
+
         if not accepted:
             return [], {'hybrid': True, 'reranking': 'not run: no relevant candidates',
                         'candidate_count': len(ranked), 'page_filter': page_filtered is not None,
-                        'threshold': settings.min_similarity}
+                        'threshold': settings.min_similarity, 'cache_hit': cache_hit,
+                        'timings': {'embedding_ms': embedding_ms, 'retrieval_ms': retrieval_ms, 'rerank_ms': 0}}
 
         limit = top_k_override or settings.top_k
         accepted = _dedupe(accepted, chunks, limit * 2)
+
+        t_rerank = time.perf_counter()
         rerank_scores = {}
         reranking = 'disabled'
         if settings.rerank:
+            if on_stage:
+                on_stage('reranking_results', 'Reranking Results', f'Scoring and prioritizing top {len(accepted)} candidate chunks...')
             try:
                 if self.reranker is None:
                     from sentence_transformers import CrossEncoder
@@ -219,6 +292,8 @@ class Retriever:
                 accepted.sort(key=lambda i: rerank_scores.get(i, 0.0), reverse=True)
                 reranking = 'completed (cross-match)'
 
+        rerank_ms = round((time.perf_counter() - t_rerank) * 1000)
+
         results = []
         for n, i in enumerate(accepted[:limit], 1):
             results.append({
@@ -231,7 +306,8 @@ class Retriever:
             })
         return results, {'hybrid': True, 'reranking': reranking, 'candidate_count': len(ranked),
                          'deduped_count': len(accepted), 'page_filter': page_filtered is not None,
-                         'threshold': settings.min_similarity}
+                         'threshold': settings.min_similarity, 'cache_hit': cache_hit,
+                         'timings': {'embedding_ms': embedding_ms, 'retrieval_ms': retrieval_ms, 'rerank_ms': rerank_ms}}
 
     def _lexical_rerank(self, question: str, chunks: list[dict], indices: list[int]) -> dict[int, float]:
         """Cross-match reranker scoring exact phrase, heading overlap, and definition patterns."""

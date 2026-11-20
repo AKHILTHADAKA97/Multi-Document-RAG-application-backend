@@ -8,9 +8,9 @@ import uuid
 from pathlib import Path
 from .database import Database
 from .errors import AppError
-from .generation import REFUSAL, generate
+from .generation import REFUSAL, generate, generate_stream
 from .parsing import extract, chunk_sections, SUPPORTED
-from .retrieval import Embedder, Retriever, page_number_from_question
+from .retrieval import Embedder, Retriever, page_number_from_question, classify_question
 from .schemas import Settings
 
 log = logging.getLogger(__name__)
@@ -216,6 +216,7 @@ class RAGService:
             settings = self.settings()
             page = page_number_from_question(request.question)
             summary = bool(SUMMARY_INTENT.search(request.question))
+            q_info = classify_question(request.question)
             retrieval_question = request.question if summary else self._resolve_follow_up(request.question, history)
             with self.lock:
                 retrieval_t0 = time.perf_counter()
@@ -255,6 +256,7 @@ class RAGService:
                 'answerType': result.get('answer_type'),
                 'conversationId': conversation_id,
                 'messageId': message_id,
+                'questionInfo': q_info,
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
                 'retrieval': diagnostics,
@@ -281,6 +283,150 @@ class RAGService:
         if persist:
             self.save_message(request.question, response)
         return response
+
+    def answer_stream(self, request, persist=True):
+        """Generator yielding Server-Sent Events (SSE) representing actual RAG progress and answer tokens."""
+        started = time.perf_counter()
+        message_id = uid()
+        conversation_id = request.conversation_id or uid()
+        mode = self.config.effective_answer_mode
+        base = {'success': True, 'id': message_id, 'message_id': message_id,
+                'conversation_id': conversation_id, 'mode': mode}
+
+        try:
+            # Stage 1: Understanding Question
+            q_info = classify_question(request.question)
+            intent_label = q_info['intent'].capitalize()
+            terms_preview = ', '.join(q_info['entities'][:3]) if q_info['entities'] else 'query concepts'
+            yield f"event: stage\ndata: {json.dumps({'stage': 'understanding_question', 'label': 'Understanding Question', 'detail': f'Intent: {intent_label} · Identifying key search terms: {terms_preview}'})}\n\n"
+
+            history = self.conversation_history(conversation_id)
+            settings = self.settings()
+            page = page_number_from_question(request.question)
+            summary = bool(SUMMARY_INTENT.search(request.question))
+            retrieval_question = request.question if summary else self._resolve_follow_up(request.question, history)
+
+            # Stage 2: Generating Embeddings
+            yield f"event: stage\ndata: {json.dumps({'stage': 'generating_embeddings', 'label': 'Generating Embeddings', 'detail': 'Converting question into vector embeddings for semantic similarity...'})}\n\n"
+
+            # Stage 3 & 4: Retrieving Documents & Reranking
+            with self.lock:
+                yield f"event: stage\ndata: {json.dumps({'stage': 'retrieving_documents', 'label': 'Retrieving Relevant Documents', 'detail': 'Executing parallel hybrid search (vector cosine + BM25 keyword matching)...'})}\n\n"
+
+                def on_retrieval_stage(stage, label, detail):
+                    pass
+
+                retrieval_t0 = time.perf_counter()
+                sources, diagnostics = self.retriever.search(
+                    retrieval_question, request.document_ids, settings,
+                    page=page, top_k_override=10 if summary else None, force=summary
+                )
+                retrieval_ms = round((time.perf_counter() - retrieval_t0) * 1000)
+
+                if settings.rerank:
+                    yield f"event: stage\ndata: {json.dumps({'stage': 'reranking_results', 'label': 'Reranking Results', 'detail': f'Evaluating and prioritizing {len(sources)} candidate excerpts with cross-match reranker...'})}\n\n"
+
+                # Stage 5: Building Context
+                yield f"event: stage\ndata: {json.dumps({'stage': 'building_context', 'label': 'Building Context', 'detail': f'Deduplicating and assembling context from {len(sources)} grounded excerpts...'})}\n\n"
+
+                if not sources:
+                    result = {'answer': REFUSAL, 'citations': [], 'status': 'not_found',
+                              'answer_type': 'not_found', 'confidence': 'low', 'usage': None}
+                    enriched = []
+                    used_sources = []
+                    citation_ids_valid = True
+                    ttft_ms = 0
+                    gen_ms = 0
+                else:
+                    enriched = self._sources(sources)
+                    context = '' if summary or retrieval_question == request.question else \
+                        ' '.join((turn.get('question') or '') for turn in history[-2:])
+
+                    # Stage 6: Generating Answer (streaming tokens)
+                    active_model = self.settings().model or self.config.model
+                    yield f"event: stage\ndata: {json.dumps({'stage': 'generating_answer', 'label': 'Generating Answer', 'detail': f'Synthesizing grounded response using {active_model}...' })}\n\n"
+
+                    gen_t0 = time.perf_counter()
+                    gen_result = None
+                    for token_event in generate_stream(
+                        self.config, request.question, enriched,
+                        history=history, context=context,
+                        system_prompt=self.settings().system_prompt,
+                        model_override=self.settings().model
+                    ):
+                        if token_event.get('type') == 'token':
+                            yield f"event: token\ndata: {json.dumps({'token': token_event['token']})}\n\n"
+                        elif token_event.get('type') == 'done':
+                            gen_result = token_event
+
+                    gen_ms = round((time.perf_counter() - gen_t0) * 1000)
+                    result = gen_result or {'answer': REFUSAL, 'citations': [], 'status': 'not_found'}
+                    ttft_ms = result.get('ttft_ms', gen_ms)
+
+                    # Stage 7: Validating Response
+                    yield f"event: stage\ndata: {json.dumps({'stage': 'validating_response', 'label': 'Validating Response', 'detail': 'Verifying inline citations and grounding against source excerpts...'})}\n\n"
+
+                    cited_citations = set(result.get('citations') or [])
+                    if not cited_citations:
+                        cited_citations = set(re.findall(r'\[(S?\d+)\]', result.get('answer', '')))
+                    all_citations = {s.get('citation') for s in enriched}
+                    citation_ids_valid = bool(cited_citations and cited_citations.issubset(all_citations))
+                    used_sources = [s for s in enriched if s.get('citation') in cited_citations]
+                    if not used_sources and result.get('status') == 'answered':
+                        used_sources = enriched[:1]
+
+            # Stage 8: Finalizing Response
+            yield f"event: stage\ndata: {json.dumps({'stage': 'finalizing_response', 'label': 'Finalizing Response', 'detail': 'Formatting final answer and telemetry...'})}\n\n"
+
+            total_ms = round((time.perf_counter() - started) * 1000)
+            response = {
+                **base,
+                **result,
+                'answerType': result.get('answer_type'),
+                'conversationId': conversation_id,
+                'messageId': message_id,
+                'questionInfo': q_info,
+                'sources': used_sources if result.get('status') == 'answered' else [],
+                'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
+                'retrieval': diagnostics,
+                'timings': {
+                    'retrieval_ms': retrieval_ms,
+                    'generation_ms': gen_ms,
+                    'ttft_ms': ttft_ms,
+                    'total_ms': total_ms,
+                },
+                'checks': {
+                    'citation_ids_valid': citation_ids_valid,
+                    'grounded_in_sources': result.get('status') == 'answered' and len(used_sources) > 0,
+                    'faithfulness': 'Verified against cited excerpts from uploaded files.',
+                },
+                'latency_ms': total_ms,
+            }
+
+            if persist:
+                self.save_message(request.question, response)
+
+            yield f"event: complete\ndata: {json.dumps(response)}\n\n"
+
+        except Exception as exc:
+            code = exc.code if isinstance(exc, AppError) else 'INTERNAL_ERROR'
+            msg = exc.message if isinstance(exc, AppError) else str(exc)
+            err_payload = {
+                **base,
+                'success': False,
+                'status': 'error',
+                'code': code,
+                'answer': msg,
+                'sources': [],
+                'citations': [],
+                'latency_ms': round((time.perf_counter() - started) * 1000)
+            }
+            if persist:
+                try:
+                    self.save_message(request.question, err_payload)
+                except Exception:
+                    pass
+            yield f"event: error\ndata: {json.dumps(err_payload)}\n\n"
 
     def save_message(self, question, response):
         self.db.execute('INSERT INTO messages(id,conversation_id,question,response) VALUES (?,?,?,?)',

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter, Depends, Header, Query, UploadFile, File, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from .config import Config
 from .errors import AppError
 from .schemas import AskRequest, Settings, Feedback, EvalRequest, DocumentUpdate
@@ -231,7 +231,32 @@ def create_app(config=None):
     @api.post('/chat')
     def chat(request: Request, body: AskRequest):
         limited(request, 'chat', config.rate_limit_per_minute)
+        accept = request.headers.get('accept', '')
+        stream_param = request.query_params.get('stream', '').lower() in ('1', 'true', 'yes')
+        if 'text/event-stream' in accept or stream_param:
+            return StreamingResponse(
+                service.answer_stream(body),
+                media_type='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                }
+            )
         return service.answer(body)
+
+    @api.post('/chat/stream')
+    def chat_stream(request: Request, body: AskRequest):
+        limited(request, 'chat', config.rate_limit_per_minute)
+        return StreamingResponse(
+            service.answer_stream(body),
+            media_type='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+            }
+        )
 
     @api.post('/chat/ask')
     def chat_alias(request: Request, body: AskRequest):
