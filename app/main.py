@@ -52,9 +52,54 @@ def create_app(config=None):
         allow_headers=['*'],
     )
 
+    log = logging.getLogger('atlas.backend')
+    log.info(f"Atlas Backend initialized in [{config.app_env}] mode.")
+    log.info(f"Allowed CORS origins: {config.cors_origins}")
+    log.info(f"Answer mode: {config.effective_answer_mode} | Embedding backend: {config.embedding_backend}")
+
+    @app.get('/', include_in_schema=False)
+    def root():
+        return {
+            'service': 'Atlas Multi-Document RAG API',
+            'version': '1.1.0',
+            'status': 'healthy',
+            'environment': config.app_env,
+            'docs': '/docs',
+            'health': '/health',
+            'ready': '/ready',
+        }
+
     @app.get('/favicon.ico', include_in_schema=False)
     def favicon():
         return Response(status_code=204)
+
+    @app.get('/health', include_in_schema=True)
+    def health():
+        return {
+            'status': 'healthy',
+            'environment': config.app_env,
+            'answer_mode': config.effective_answer_mode,
+        }
+
+    @app.get('/ready', include_in_schema=True)
+    def ready():
+        try:
+            with service.db.connect() as con:
+                con.execute('SELECT 1').fetchone()
+            db_status = 'connected'
+        except Exception as exc:
+            logging.getLogger(__name__).error(f"Readiness check failed: {exc}")
+            return JSONResponse(
+                status_code=503,
+                content={'status': 'not_ready', 'database': 'unavailable', 'error': 'Database unavailable'}
+            )
+        return {
+            'status': 'ready',
+            'database': db_status,
+            'environment': config.app_env,
+            'answer_mode': config.effective_answer_mode,
+            'embedding_backend': config.embedding_backend,
+        }
 
     @app.exception_handler(AppError)
     async def app_error(request, exc):
@@ -78,11 +123,15 @@ def create_app(config=None):
         if not limiter.allow(f'{bucket}:{client}', limit):
             raise AppError('RATE_LIMITED', 'Too many requests. Wait a moment and try again.', 429)
 
-    @app.get('/health')
-    def health():
-        return {'status': 'ok', 'answer_mode': config.effective_answer_mode}
-
     api = APIRouter(prefix='/api', dependencies=[Depends(authorize)])
+
+    @api.get('/health', include_in_schema=False)
+    def api_health():
+        return health()
+
+    @api.get('/ready', include_in_schema=False)
+    def api_ready():
+        return ready()
 
     @api.get('/config')
     def public_config():
