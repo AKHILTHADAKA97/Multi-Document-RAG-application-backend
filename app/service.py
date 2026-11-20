@@ -14,6 +14,7 @@ from .generation import REFUSAL, generate, generate_stream
 from .parsing import extract, chunk_sections, SUPPORTED
 from .retrieval import Embedder, Retriever, page_number_from_question, classify_question
 from .schemas import Settings
+from .query_understanding_agent import QueryUnderstandingAgent
 
 log = logging.getLogger(__name__)
 
@@ -337,8 +338,12 @@ class RAGService:
             settings = self.settings()
             page = page_number_from_question(request.question)
             summary = bool(SUMMARY_INTENT.search(request.question))
-            q_info = classify_question(request.question)
-            retrieval_question = request.question if summary else self._resolve_follow_up(request.question, history)
+
+            # Intelligent Query Understanding & Normalization
+            understood = QueryUnderstandingAgent.process_query(request.question, history)
+            q_info = classify_question(understood['retrieval_query'])
+
+            retrieval_question = request.question if summary else understood['retrieval_query']
             with self.lock:
                 retrieval_t0 = time.perf_counter()
                 sources, diagnostics = self.retriever.search(
@@ -371,12 +376,31 @@ class RAGService:
                     used_sources = [s for s in enriched if s.get('citation') in cited_citations]
                     if not used_sources and result.get('status') == 'answered':
                         used_sources = enriched[:1]
+
+            # Generate smart follow-up question suggestions
+            suggested_questions = QueryUnderstandingAgent.generate_suggestions(
+                understood.get('corrected_query') or request.question,
+                result.get('answer', ''),
+                sources=enriched,
+                history=history,
+            )
+
             response = {
                 **base,
                 **result,
                 'answerType': result.get('answer_type'),
                 'conversationId': conversation_id,
                 'messageId': message_id,
+                'originalQuestion': request.question,
+                'correctedQuery': understood.get('corrected_query'),
+                'isCorrected': understood.get('is_corrected', False),
+                'correctionNotes': understood.get('correction_notes', []),
+                'understoodIntent': understood.get('intent', 'general'),
+                'isFollowUp': understood.get('is_follow_up', False),
+                'referencedEntity': understood.get('referenced_entity'),
+                'isDuplicate': understood.get('is_duplicate', False),
+                'suggestedQuestions': suggested_questions,
+                'suggested_questions': suggested_questions,
                 'questionInfo': q_info,
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
@@ -415,17 +439,27 @@ class RAGService:
                 'conversation_id': conversation_id, 'mode': mode}
 
         try:
-            # Stage 1: Understanding Question
-            q_info = classify_question(request.question)
-            intent_label = q_info['intent'].capitalize()
-            terms_preview = ', '.join(q_info['entities'][:3]) if q_info['entities'] else 'query concepts'
-            yield f"event: stage\ndata: {json.dumps({'stage': 'understanding_question', 'label': 'Understanding Question', 'detail': f'Intent: {intent_label} · Identifying key search terms: {terms_preview}'})}\n\n"
-
             history = self.conversation_history(conversation_id)
             settings = self.settings()
             page = page_number_from_question(request.question)
             summary = bool(SUMMARY_INTENT.search(request.question))
-            retrieval_question = request.question if summary else self._resolve_follow_up(request.question, history)
+
+            # Stage 1: Understanding Question (Intelligent Query Agent)
+            understood = QueryUnderstandingAgent.process_query(request.question, history)
+            q_info = classify_question(understood['retrieval_query'])
+
+            intent_label = understood['intent'].capitalize()
+            if understood.get('is_corrected'):
+                detail_msg = f"Intent: {intent_label} · Corrected typo: \"{understood['corrected_query']}\""
+            elif understood.get('is_follow_up') and understood.get('referenced_entity'):
+                detail_msg = f"Intent: {intent_label} · Context resolved: \"{understood['referenced_entity']}\""
+            else:
+                terms_preview = ', '.join(q_info['entities'][:3]) if q_info['entities'] else 'query concepts'
+                detail_msg = f"Intent: {intent_label} · Key search terms: {terms_preview}"
+
+            yield f"event: stage\ndata: {json.dumps({'stage': 'understanding_question', 'label': 'Understanding Question', 'detail': detail_msg, 'corrected_query': understood.get('corrected_query'), 'is_corrected': understood.get('is_corrected', False)})}\n\n"
+
+            retrieval_question = request.question if summary else understood['retrieval_query']
 
             # Stage 2: Generating Embeddings
             yield f"event: stage\ndata: {json.dumps({'stage': 'generating_embeddings', 'label': 'Generating Embeddings', 'detail': 'Converting question into vector embeddings for semantic similarity...'})}\n\n"
@@ -497,7 +531,15 @@ class RAGService:
                         used_sources = enriched[:1]
 
             # Stage 8: Finalizing Response
-            yield f"event: stage\ndata: {json.dumps({'stage': 'finalizing_response', 'label': 'Finalizing Response', 'detail': 'Formatting final answer and telemetry...'})}\n\n"
+            yield f"event: stage\ndata: {json.dumps({'stage': 'finalizing_response', 'label': 'Finalizing Response', 'detail': 'Formatting final answer and generating smart follow-ups...'})}\n\n"
+
+            # Generate smart follow-up suggestions
+            suggested_questions = QueryUnderstandingAgent.generate_suggestions(
+                understood.get('corrected_query') or request.question,
+                result.get('answer', ''),
+                sources=enriched,
+                history=history,
+            )
 
             total_ms = round((time.perf_counter() - started) * 1000)
             response = {
@@ -506,6 +548,16 @@ class RAGService:
                 'answerType': result.get('answer_type'),
                 'conversationId': conversation_id,
                 'messageId': message_id,
+                'originalQuestion': request.question,
+                'correctedQuery': understood.get('corrected_query'),
+                'isCorrected': understood.get('is_corrected', False),
+                'correctionNotes': understood.get('correction_notes', []),
+                'understoodIntent': understood.get('intent', 'general'),
+                'isFollowUp': understood.get('is_follow_up', False),
+                'referencedEntity': understood.get('referenced_entity'),
+                'isDuplicate': understood.get('is_duplicate', False),
+                'suggestedQuestions': suggested_questions,
+                'suggested_questions': suggested_questions,
                 'questionInfo': q_info,
                 'sources': used_sources if result.get('status') == 'answered' else [],
                 'citations': [s['citation'] for s in used_sources] if result.get('status') == 'answered' else [],
